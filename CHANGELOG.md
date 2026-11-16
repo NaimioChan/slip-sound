@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Selecting a sound starts playback much sooner when auditioning a list. The waveform used to point a single hidden `<audio>` element at each new file, which costs the media pipeline 40–90 ms before the first sample (measured: 50–100 ms click-to-sound on a 40-file, 330 MB library). It now keeps a pool of four elements: one plays while the others hold the files next to the selection, so a click or `↓`/`↑` plays an already-buffered element instead. Measured click-to-sound over the same library: 10–26 ms walking the list, 1–2 ms for a file played before. Files over 24 MB are not preloaded, so pausing on a large recording never pulls it into memory.
+- Rows are read straight off the index for the row the keyboard just moved to. Arrow/Home/End used to call play after `setSelected`, so the waveform could still be on the previous row when playback started.
+
 ## v2.3.0
 
 ### Added

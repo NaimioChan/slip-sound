@@ -384,14 +384,15 @@ function MainWorkstation() {
     setMultiSelected(new Map())
     setSelected(index)
     if (autoPlay()) {
-      waveApi?.play()
+      waveApi?.play(row.path)
     }
   }
 
   function onRowDblClick(index: number, e: MouseEvent): void {
     e.stopPropagation()
+    const row = results()[index]
     setSelected(index)
-    waveApi?.play()
+    waveApi?.play(row?.path)
   }
 
   function onRowDragStart(index: number, e: DragEvent): void {
@@ -474,7 +475,7 @@ function MainWorkstation() {
     const allFav = m.targets.every((r) => r.favorite)
     const many = (label: string): string => (one ? label : `${label} (${n})`)
     return [
-      { id: 'row-menu-play', label: 'Play', shortcut: 'Space', icon: Play, disabled: !one, onClick: () => { setSelected(m.index); waveApi?.play() } },
+      { id: 'row-menu-play', label: 'Play', shortcut: 'Space', icon: Play, disabled: !one, onClick: () => { setSelected(m.index); waveApi?.play(m.targets[0]?.path) } },
       { id: 'row-menu-effects', label: many('Effects…'), shortcut: 'Ctrl+P', icon: SlidersHorizontal, onClick: () => openEffects() },
       { id: 'row-menu-slice', label: 'Slice…', shortcut: 'Ctrl+K', icon: Scissors, disabled: !one, onClick: () => openSlicer() },
       { id: 'row-menu-loop', label: 'Make Seamless Loop…', shortcut: 'Ctrl+L', icon: Repeat, disabled: !one, onClick: () => openLoopTool() },
@@ -802,26 +803,36 @@ function MainWorkstation() {
       return
     }
 
+    // Arrow/Home/End move the selection, then play the row they landed on.
+    // The row is read from the computed index because setSelected() has not
+    // been applied yet.
+    const playAt = (i: number): void => {
+      if (autoPlay()) waveApi?.play(results()[i]?.path)
+    }
+
     if (e.key === 'ArrowDown') {
       e.preventDefault()
-      setSelected((s) => Math.min(s + 1, results().length - 1))
+      const next = Math.min(selected() + 1, results().length - 1)
+      setSelected(next)
       scrollSelectedIntoView()
-      if (autoPlay()) waveApi?.play()
+      playAt(next)
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
-      setSelected((s) => Math.max(s - 1, 0))
+      const next = Math.max(selected() - 1, 0)
+      setSelected(next)
       scrollSelectedIntoView()
-      if (autoPlay()) waveApi?.play()
+      playAt(next)
     } else if (e.key === 'Home' && !isInput) {
       e.preventDefault()
       setSelected(0)
       scrollSelectedIntoView()
-      if (autoPlay()) waveApi?.play()
+      playAt(0)
     } else if (e.key === 'End' && !isInput) {
       e.preventDefault()
-      setSelected(Math.max(0, results().length - 1))
+      const last = Math.max(0, results().length - 1)
+      setSelected(last)
       scrollSelectedIntoView()
-      if (autoPlay()) waveApi?.play()
+      playAt(last)
     } else if (e.code === 'Space' && !isInput) {
       e.preventDefault()
       waveApi?.togglePlay()
@@ -843,6 +854,23 @@ function MainWorkstation() {
 
   const selectedRow = (): SoundRow | null => {
     return results()[selected()] ?? null
+  }
+
+  // The rows to buffer ahead of the selection: the next three down the list
+  // (auditioning usually runs forward) and the two above, so stepping back to
+  // compare a sound with the one before it is instant too. The pool holds the
+  // first few of these; the order decides which survive.
+  const neighbourRows = (): SoundRow[] => {
+    const rows = results()
+    const i = selected()
+    if (i < 0 || i >= rows.length) return []
+    const out: SoundRow[] = []
+    if (rows[i + 1]) out.push(rows[i + 1])
+    if (rows[i - 1]) out.push(rows[i - 1])
+    if (rows[i + 2]) out.push(rows[i + 2])
+    if (rows[i - 2]) out.push(rows[i - 2])
+    if (rows[i + 3]) out.push(rows[i + 3])
+    return out
   }
 
   const multiSelectTotalSize = (): number => {
@@ -1008,6 +1036,9 @@ function MainWorkstation() {
         {/* Waveform Bottom Dock Panel - Full Width across bottom */}
         <WaveformPreview
           row={selectedRow()}
+          // Neighbours in list order, so the next click or arrow key is already
+          // buffered when it happens.
+          preloadRows={neighbourRows()}
           selectedCount={multiSelected().size > 0 ? multiSelected().size : (selectedRow() ? 1 : 0)}
           onApi={(api) => (waveApi = api)}
           onExportRequest={(region) => {

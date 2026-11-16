@@ -22,16 +22,26 @@ import {
 
 export interface WaveformApi {
   togglePlay: () => void
-  play: () => void
+  // `path` names the file to play. App calls this right after changing the
+  // selection, before the props update reaches this component, so without it
+  // the call would play the file that is still selected.
+  play: (path?: string) => void
   pause: () => void
 }
 
 const DRAG_THRESHOLD_PX = 4
 // Shortest selection treated as a playable/loopable region, in seconds.
 const MIN_REGION_SEC = 0.03
+// Preloading a file means decoding its header and buffering its first frames.
+// Above this size the hint is skipped, so a 200MB field recording is never
+// pulled in just because the user paused on the row above it.
+const PRELOAD_MAX_BYTES = 24 * 1024 * 1024
 
 export default function WaveformPreview(props: {
   row: SoundRow | null
+  // Files next to the selected one (in list order). They're buffered into idle
+  // elements ahead of time so arrowing through the list starts instantly.
+  preloadRows?: SoundRow[]
   selectedCount?: number
   onApi?: (api: WaveformApi) => void
   onExportRequest?: (region: { start: number; end: number } | null) => void
@@ -41,7 +51,29 @@ export default function WaveformPreview(props: {
 }) {
   let canvas: HTMLCanvasElement | undefined
   let canvasWrap: HTMLDivElement | undefined
+  let audioPoolEl: HTMLDivElement | undefined
+
+  // Playback runs on a small pool of hidden elements that take turns. Pointing
+  // one element at a new file costs 40-90ms of media-pipeline setup before the
+  // first sample is heard; an element that already holds the file starts in
+  // about a millisecond. So the active element plays while the others buffer
+  // the files next to the selection, and switching plays the element that
+  // already has it.
+  // One element plays while the rest buffer the rows around the selection.
+  // Four gives three warm slots: the row above and the two below, in the
+  // priority order `preloadRows` is built with.
+  const POOL_SIZE = 4
+  const pool: HTMLAudioElement[] = []
+  // The element driving the UI: playing, or paused at its position.
   let audioEl: HTMLAudioElement | undefined
+  let activePath = ''
+  // Which file each pool element holds.
+  const elPath = new WeakMap<HTMLAudioElement, string>()
+  let preloadTimer: ReturnType<typeof setTimeout> | undefined
+  // Set when playback was asked for while the pool was still switching files.
+  let playRequested = false
+  // The file that request was for, so a stale request never starts the wrong one.
+  let playWhenReady = ''
 
   const [peaks, setPeaks] = createSignal<Float32Array | null>(null)
   const [loading, setLoading] = createSignal(false)
@@ -75,6 +107,39 @@ export default function WaveformPreview(props: {
   let lastLoadedPath = ''
   let loadDebounceTimer: ReturnType<typeof setTimeout> | undefined
   const [loadError, setLoadError] = createSignal<string | null>(null)
+
+  // Pool elements live outside the component tree (no JSX ref, no re-render),
+  // and every media event is ignored unless it came from the active element.
+  function makePoolElement(): HTMLAudioElement {
+    const el = new Audio()
+    el.preload = 'auto'
+    el.addEventListener('play', () => {
+      if (el === audioEl) onAudioPlay()
+    })
+    el.addEventListener('playing', () => {
+      if (el === audioEl) scheduleLoopCheck()
+    })
+    el.addEventListener('pause', () => {
+      if (el === audioEl) onAudioPause()
+    })
+    el.addEventListener('seeked', () => {
+      if (el === audioEl) scheduleLoopCheck()
+    })
+    el.addEventListener('timeupdate', () => {
+      if (el === audioEl) onAudioTimeUpdate()
+    })
+    el.addEventListener('loadedmetadata', () => {
+      if (el === audioEl) onAudioLoaded()
+    })
+    el.addEventListener('ended', () => {
+      if (el === audioEl) onAudioEnded()
+    })
+    return el
+  }
+  for (let i = 0; i < POOL_SIZE; i++) pool.push(makePoolElement())
+  // Until a selection moves it, the first element carries the historical id
+  // (the screenshot script and debugging tools look playback up by it).
+  if (pool[0]) pool[0].id = 'waveform-audio-element'
 
   // The overview comes from the main process (streamed through ffmpeg and cached),
   // so long files never have to be downloaded and decoded here.
@@ -237,14 +302,17 @@ export default function WaveformPreview(props: {
       setSelEnd(null)
       bumpRegion()
       cancelAnimationFrame(rafId!)
-      if (audioEl) {
-        audioEl.pause()
+      const el = audioEl
+      if (el) {
+        el.pause()
         // src = '' resolves to the page URL and triggers a failed load.
-        audioEl.removeAttribute('src')
-        audioEl.load()
+        el.removeAttribute('src')
+        el.load()
+        elPath.delete(el)
         setProgress(0)
         setPlaying(false)
       }
+      activePath = ''
       return
     }
 
@@ -259,11 +327,42 @@ export default function WaveformPreview(props: {
     bumpRegion()
     cancelAnimationFrame(rafId!)
 
-    if (audioEl) {
-      audioEl.pause()
-      audioEl.src = window.api.audioUrl(row.path)
-      setProgress(0)
+    // Switching files: hand playback to the element that already holds this
+    // one (preloaded), or the first idle element when nothing has it yet.
+    const target =
+      pool.find((el) => elPath.get(el) === row.path) ?? pool.find((el) => el !== audioEl)
+    if (target) {
+      const previous = audioEl
+      // Reassign before pausing the old element: its 'pause' event then sees
+      // el !== audioEl and is ignored, instead of clearing the UI state of the
+      // file that is taking over.
+      audioEl = target
+      activePath = row.path
+      // #waveform-audio-element follows the active element (the screenshot
+      // script and manual debugging look it up by id).
+      if (previous?.id) previous.removeAttribute('id')
+      target.id = 'waveform-audio-element'
+      if (previous && previous !== target) previous.pause()
+      if (elPath.get(target) !== row.path) {
+        target.pause()
+        target.src = window.api.audioUrl(row.path)
+        elPath.set(target, row.path)
+      }
+      target.volume = muted() ? 0 : volume()
       setPlaying(false)
+      setProgress(0)
+    }
+
+    // The click that selected this row may have asked to play before the pool
+    // switched, when the old file was still the active one. Only honour it if
+    // it was for this file.
+    if (playRequested && playWhenReady === row.path) {
+      playRequested = false
+      playWhenReady = ''
+      startPlayback(row.path)
+    } else if (playRequested) {
+      playRequested = false
+      playWhenReady = ''
     }
 
     clearTimeout(loadDebounceTimer)
@@ -271,7 +370,37 @@ export default function WaveformPreview(props: {
     loadDebounceTimer = setTimeout(() => {
       loadWaveform(row)
     }, 50)
+
+    schedulePreload(row.path)
   })
+
+  // Keeps the elements next to the selection buffered, so the next click or
+  // arrow key starts from local data instead of hitting the media pipeline
+  // cold. Runs after a short idle gap: while arrowing fast, each new selection
+  // restarts the timer and only the file that settles gets preloaded.
+  function schedulePreload(currentPath: string): void {
+    clearTimeout(preloadTimer)
+    preloadTimer = setTimeout(() => {
+      const idle = pool.filter((el) => el !== audioEl)
+      if (idle.length === 0) return
+      // Hold the nearest neighbours, in the order props gives them. That order
+      // is forward-biased, because auditioning runs down the list; a warm
+      // element for the row above is only kept when a slot is left over.
+      const wanted = (props.preloadRows ?? [])
+        .filter((r) => r.path !== currentPath && (r.filesize ?? 0) <= PRELOAD_MAX_BYTES)
+        .slice(0, idle.length)
+      const missing = wanted.filter((r) => !idle.some((el) => elPath.get(el) === r.path))
+      // Slots whose file is no longer wanted, in pool order.
+      const reuse = idle.filter((el) => !wanted.some((r) => r.path === elPath.get(el)))
+      for (let i = 0; i < missing.length && i < reuse.length; i++) {
+        const el = reuse[i]
+        el.pause()
+        el.src = window.api.audioUrl(missing[i].path)
+        elPath.set(el, missing[i].path)
+        el.load()
+      }
+    }, 120)
+  }
 
   function regionBounds(): { start: number; end: number } | null {
     const s = selStart()
@@ -333,8 +462,20 @@ export default function WaveformPreview(props: {
 
   // Starts playback, snapping into the selected region first if the playhead
   // sits outside it (e.g. after the file ended, or paused before the region).
-  function startPlayback(): void {
-    if (!audioEl) return
+  // `wantedPath` lets the caller name the file being selected, since the props
+  // update for a click may not have landed yet.
+  function startPlayback(wantedPath?: string): void {
+    const path = wantedPath ?? props.row?.path
+    if (!audioEl || !path) return
+    // The pool has not switched to that file yet: remember the request and let
+    // the selection effect start it, on the element that holds it.
+    if (activePath !== path) {
+      playRequested = true
+      playWhenReady = path
+      return
+    }
+    playRequested = false
+    playWhenReady = ''
     const region = regionBounds()
     if (
       region &&
@@ -529,6 +670,12 @@ export default function WaveformPreview(props: {
   let resizeObserver: ResizeObserver | undefined
 
   onMount(() => {
+    // The pool elements live in the hidden container so they're ordinary DOM
+    // media elements (inspectable, and reachable from the screenshot script),
+    // while staying out of the component's reactive tree.
+    if (audioPoolEl) {
+      for (const el of pool) audioPoolEl.appendChild(el)
+    }
     props.onApi?.({
       togglePlay,
       play: startPlayback,
@@ -732,19 +879,12 @@ export default function WaveformPreview(props: {
         </div>
       </div>
 
-      <audio
-        id="waveform-audio-element"
-        ref={audioEl}
-        preload="auto"
-        onPlay={onAudioPlay}
-        onPause={onAudioPause}
-        onPlaying={scheduleLoopCheck}
-        onSeeked={scheduleLoopCheck}
-        onTimeUpdate={onAudioTimeUpdate}
-        onLoadedMetadata={onAudioLoaded}
-        onEnded={onAudioEnded}
-        style={{ display: 'none' }}
-      />
+      {/* Playback elements are created imperatively and attached here: pointing
+          a fresh element at a file costs the media pipeline 40-90ms, so a pool
+          of them stays warm with the files next to the selection. Kept in the
+          DOM (hidden) so they behave like ordinary media elements.
+          #waveform-audio-element is the active one, as before. */}
+      <div ref={audioPoolEl} style={{ display: 'none' }} />
     </div>
   )
 }
