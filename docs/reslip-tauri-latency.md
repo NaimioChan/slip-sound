@@ -48,14 +48,14 @@ all: [0.06, 0.07, 0.07, 0.07, 0.08, 0.08, 1.13, 8.33, 8.63, 8.71,
 
 双峰分布，含义很清楚：如果片段恰好在回调刚取完缓冲后发布，要等到下一次回调（约 0–0.1ms 是撞上回调边缘的情况；8–10.4ms 是等一个完整周期）；平均等待约 5ms，最坏 10.4ms。
 
-回调几何由设备驱动决定，请求更小的 buffer **无效**：
+回调几何由设备驱动决定，请求更小的 buffer **无效**（两轮独立测量，`Fixed(64)` 那轮出现一个 882 帧的抖动块，均值被拉到 11.0ms，其余各轮稳定在 446 帧）：
 
 ```
 request=None  -> 100 callbacks/s, 446 frames/callback (10.12 ms of audio)
-request=512   ->  94 callbacks/s, 470 frames/callback (10.66 ms)
+request=512   ->  94-100 callbacks/s, 446-470 frames/callback (10.1-10.7 ms)
 request=256   -> 100 callbacks/s, 446 frames/callback (10.12 ms)
-request=128   -> 100 callbacks/s, 446 frames/callback (10.12 ms)
-request=64    ->  99 callbacks/s, 446 frames/callback (10.12 ms)
+request=128   ->  99-100 callbacks/s, 446 frames/callback (10.12 ms)
+request=64    -> 92-99 callbacks/s, 446-485 frames/callback (10.1-11.0 ms)
 request=32    -> 100 callbacks/s, 446 frames/callback (10.12 ms)
 ```
 
